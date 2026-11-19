@@ -392,6 +392,7 @@ class ImageMarkers(unittest.TestCase):
                                                          {"type": "image", "source": "x.png"}]}]
                     ids, _, _ = svc.prepare(msgs, None, {})
                     self.assertEqual(ids.count(pad), 3)          # the image's three rows, nothing else
+                    self.assertEqual(svc.embeddings.text_end, ids.index(pad))
                     self.assertIn("<|image_pad|> marks" if "docs" in text else "plain", tok.decode(ids))
             svc.embeddings.path.unlink(missing_ok=True)
 

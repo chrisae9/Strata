@@ -859,8 +859,11 @@ restarting restores ordinary replica routing.
 After a successful long text turn, the server saves its state before releasing the replica. A follow-up with a
 matching prompt prefix can take the next available compatible replica. Native RESTORE verifies the model and
 settings, and generation checks the actual token prefix. The destination keeps a checkpoint of its previous long
-text conversation. A failed save, an eviction, or an image in the request can leave a chat on ordinary routing.
-Small text histories (under 8192 tokens) can be reread. Image turns use the existing vision path. A replica holding
+text conversation. A failed save or an eviction can leave a chat on ordinary routing.
+Small text histories (under 8192 tokens) can be reread. When a screenshot is appended, the receiving replica can restore a text checkpoint that matches before the first
+image. It processes the images with their native identity checks. Image-bearing states stay local. A screenshot
+without a matching checkpoint can take the first free GPU when the living replicas have similar native prefix
+matches. A cache advantage of at least 8192 tokens keeps the usual cache/load routing policy. A replica holding
 an uncheckpointed long or image turn can serve it normally without replacing its live state via a handoff.
 
 Check the server log for `handoff saved replica` and `handoff restored replica`, then check the engine's prompt

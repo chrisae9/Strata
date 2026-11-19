@@ -2,6 +2,7 @@ import pathlib
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from serve.replica_handoff import Handoff
@@ -83,6 +84,50 @@ class ReplicaHandoffTest(unittest.TestCase):
         self.stop.set()
         g.close()
         self.assertFalse(self.store.entries)
+
+    def test_screenshot_imports_only_a_previous_text_prefix(self):
+        self.turn(3)
+        self.r.inflight[0] = 1
+        self.stop._strata_text_before_image = 256
+        request = [3] * 256 + [9] * 32
+        with patch.object(self.b, "generate", wraps=self.b.generate) as generate:
+            self.assertEqual(list(self.r.generate(request, 2, {}, self.stop, embeddings="new.sve")), [17])
+        self.assertEqual(self.b.restores, [3])
+        self.assertEqual(generate.call_args.kwargs["embeddings"], "new.sve")
+        self.assertEqual(len(self.store.entries), 1)  # image state was not published
+
+    def test_matching_pad_ids_after_first_image_do_not_authorize_a_restore(self):
+        self.turn(3)
+        self.r.inflight[0] = 1
+        self.stop._strata_text_before_image = 32
+        self.turn(3, img="unrelated.sve")
+        self.assertFalse(self.b.restores)
+
+    def test_cold_screenshot_chooses_first_release_and_can_cancel(self):
+        for cancel in (False, True):
+            self.r.inflight[:] = [1, 1]
+            self.stop.clear()
+            waiting = threading.Event()
+            real_wait = self.r.available.wait
+
+            def wait(timeout):
+                waiting.set()
+                return real_wait(timeout)
+
+            with patch.object(self.r.available, "wait", side_effect=wait), ThreadPoolExecutor(1) as pool:
+                future = pool.submit(self.turn, 6 if cancel else 5, "new.sve")
+                try:
+                    self.assertTrue(waiting.wait(2))
+                finally:
+                    with self.r.available:
+                        if cancel:
+                            self.stop.set()
+                        self.r.inflight[1] = 0
+                        self.r.available.notify_all()
+                self.assertEqual(future.result(timeout=2), [] if cancel else [17])
+            self.assertEqual(self.r.inflight, [1, 0])
+        self.assertEqual(self.b.state, 5)
+        self.assertEqual(self.r.routed, [0, 1])
 
     def test_refused_restore_falls_back(self):
         self.turn(3)

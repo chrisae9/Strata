@@ -575,22 +575,27 @@ class ReplicaEngine:
             threading.Thread(target=run, daemon=True).start()
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-        if self.handoff is None or embeddings is not None:
+        if self.handoff is None:
             yield from self._generate_on(self.route(ids), None, ids, max_new, sampling, cancel, embeddings)
             return
-        with self.handoff.match(ids) as checkpoint:
-            if checkpoint is None:
+        # Checkpoints contain text only. In GENI the same pad ids can stand for different
+        # pictures; only the part preceding the first real image may identify a portable prefix.
+        prefix = ids if embeddings is None else ids[:getattr(cancel, "_strata_text_before_image", 0)]
+        with self.handoff.match(prefix) as checkpoint:
+            if checkpoint is None and embeddings is None:
                 k = self.route(ids)
             else:
-                k = self._route_checkpoint(checkpoint, ids, cancel)
+                k = self._route_available(checkpoint, ids, cancel)
                 if k is None:     # cancelled before reserving an engine
                     return
             yield from self._generate_on(k, checkpoint, ids, max_new, sampling, cancel, embeddings)
 
-    def _route_checkpoint(self, checkpoint, ids, cancel):
+    def _route_available(self, checkpoint, ids, cancel):
         # Choose at availability time. A thread queued on the source engine's run_lock
         # cannot notice the other GPU finishing. Ordinary requests keep the stock policy.
         matched = self.router.matched(ids)
+        chosen = None
+        waiting_since = None
         with self.available:
             while True:
                 if cancel is not None and cancel.is_set():
@@ -598,17 +603,35 @@ class ReplicaEngine:
                 alive = [k for k, e in enumerate(self.engines) if e.alive()]
                 if not alive:
                     return -1
-                ready = [k for k in alive if not self.inflight[k] and self.handoff.ready(checkpoint, k)]
+                if checkpoint is None:
+                    # No portable prefix. If a living engine has a meaningful native cache
+                    # advantage, keep the usual cache/load tradeoff. Otherwise choose on release.
+                    hits = [matched[k] for k in alive]
+                    if max(hits) - min(hits) >= self.handoff.minimum:
+                        break
+                    compatible = alive
+                else:
+                    compatible = [k for k in alive if self.handoff.ready(checkpoint, k)]
+                ready = [k for k in compatible if not self.inflight[k]]
                 if ready:
                     k = max(ready, key=lambda k: (matched[k], -self.routed[k]))
                     self.inflight[k] += 1
                     self.routed[k] += 1
-                    return k
-                if not all(self.inflight[k] for k in alive) and not any(
-                        self.handoff.ready(checkpoint, k) for k in alive):
+                    chosen = k
+                    break
+                if not compatible and any(not self.inflight[k] for k in alive):
                     break    # protected live sessions: use native routing and cache behavior
+                if waiting_since is None:
+                    waiting_since = time.monotonic()
                 self.available.wait(.25)
-        return self.route(ids)
+        if chosen is None:
+            return self.route(ids)
+        if len(alive) < len(self.engines):
+            self.heal()
+        if checkpoint is None and waiting_since is not None:
+            print(f"[strata] image request took free replica {chosen} after "
+                  f"{time.monotonic() - waiting_since:.3f}s", flush=True)
+        return chosen
 
     def _generate_on(self, k, checkpoint, ids, max_new, sampling, cancel, embeddings):
         # imported here: serve.server imports this module

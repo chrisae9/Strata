@@ -4990,6 +4990,7 @@ class Service:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         self.embeddings.keys = None
+        self.embeddings.text_end = 0
         images = images_of(messages)
         if images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
@@ -5030,6 +5031,8 @@ class Service:
                     # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
                     if k == len(encoded):
                         raise ValueError("the prompt and its images do not match")
+                    if k == 0:
+                        self.embeddings.text_end = len(out)
                     out += [pad] * encoded[k][1]
                     k += 1
                 elif t == pad:
@@ -5314,6 +5317,8 @@ class Service:
         admission_rejected = False                      # #3040: the engine's batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
+        if emb:
+            cancel._strata_text_before_image = getattr(self.embeddings, "text_end", 0)
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
