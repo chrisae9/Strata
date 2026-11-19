@@ -1,5 +1,8 @@
 import pathlib
 import tempfile
+import subprocess
+import sys
+import time
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -7,7 +10,7 @@ from unittest.mock import patch
 
 from serve.replica_handoff import Handoff
 from serve.replicas import ReplicaEngine
-from serve.server_parts.engines import EngineDied, SessionRefused
+from serve.server_parts.engines import EngineDied, EngineNonFinite, QueueWaitExpired, SessionRefused
 
 
 class Engine:
@@ -149,6 +152,79 @@ class ReplicaHandoffTest(unittest.TestCase):
         self.assertTrue(self.a.ended)
         self.assertEqual(self.r.inflight, [0, 0])
         self.assertFalse(self.store.entries)
+
+    def test_new_image_of_same_size_does_not_queue_on_false_native_hit(self):
+        # A long suffix after different images must not count toward affinity.
+        self.stop._strata_text_before_image = 32
+        ids = [2] * 32 + [9] * 40 + [6] * 8000
+        def picture(key):
+            return list(self.r.generate(ids, 2, {"strata_img_keys": [key]}, self.stop, embeddings="img"))
+        picture("aaaa")
+        self.r.inflight[0] = 1
+        self.assertEqual(picture("bbbb"), [17])
+        self.assertEqual(self.r.routed, [1, 1])
+
+    def test_continuation_can_evict_its_own_old_snapshot(self):
+        self.store.budget = 128
+        for n in (160, 200, 240):
+            list(self.r.generate([3] * n, 2, {}, self.stop))
+            entries = list(self.store.entries.values())
+            self.assertEqual([len(e.prefix) for e in entries], [n - 64])
+
+    def test_alternating_chats_restore_when_native_residency_is_unknown(self):
+        self.r.inflight[1] = 1
+        for chat in (3, 4, 3):
+            self.turn(chat)
+        self.assertEqual(self.a.restores, [3])
+
+    def test_numerical_failure_bypasses_restore_on_retry(self):
+        self.r.inflight[1] = 1
+        self.turn(3)
+        with self.store.match([3]*256) as leased:
+            with patch.object(self.a, "generate", side_effect=EngineNonFinite("bad logits")):
+                with self.assertRaises(EngineNonFinite):
+                    self.turn(3)
+            self.assertFalse(self.store.entries)
+            self.assertTrue(leased.path.exists())
+            self.store.restore(leased, 0, self.a)
+        self.assertFalse(leased.path.exists())
+        self.turn(3)
+        self.assertEqual(self.a.restores, [])
+
+    def test_availability_and_reserved_lock_respect_deadline(self):
+        self.r.inflight[:] = [1, 1]
+        self.stop._strata_queue_deadline = time.monotonic() + .03
+        with self.assertRaises(QueueWaitExpired):
+            self.turn(3, "image")
+        self.assertEqual(self.r.inflight, [1, 1])
+        with self.r.run_locks[0], self.r.run_locks[1]:
+            self.stop._strata_queue_deadline = time.monotonic() + .03
+            with self.assertRaises(QueueWaitExpired):
+                self.turn(3)
+        self.assertEqual(self.r.inflight, [1, 1])
+
+    def test_waiting_cold_screenshot_triggers_heal(self):
+        self.r.inflight[0] = 1
+        alive = threading.Event()
+        with patch.object(self.b, "alive", side_effect=alive.is_set), \
+             patch.object(self.b, "restart", side_effect=alive.set, create=True):
+            self.stop._strata_queue_deadline = time.monotonic() + 2
+            self.assertEqual(self.turn(4, "image"), [17])
+        self.assertTrue(alive.is_set())
+        self.assertEqual(self.r.routed, [0, 1])
+
+    def test_restart_removes_only_abandoned_checkpoint_directory(self):
+        script = ("from serve.replica_handoff import Handoff; import os, sys;"
+                  "h=Handoff(sys.argv[1], 1, 2); print(h.directory.name, flush=True); os._exit(0)")
+        result = subprocess.run([sys.executable, "-c", script, self.tmp.name],
+                                cwd=pathlib.Path(__file__).resolve().parents[1],
+                                capture_output=True, text=True, check=True)
+        abandoned = pathlib.Path(result.stdout.strip())
+        self.assertTrue(abandoned.is_dir())
+        new = Handoff(self.tmp.name, 1, 2)
+        self.addCleanup(new.close)
+        self.assertFalse(abandoned.exists())
+        self.assertTrue(pathlib.Path(self.store.directory.name).is_dir())
 
     def test_in_use_file_survives_eviction(self):
         self.store.budget = 128

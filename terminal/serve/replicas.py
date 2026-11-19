@@ -36,6 +36,7 @@ the host threads of the engines (the expert workers) do not compete.  "replica_c
 from __future__ import annotations
 
 import collections
+import contextlib
 import copy
 import os
 import sys
@@ -576,19 +577,39 @@ class ReplicaEngine:
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         if self.handoff is None:
-            yield from self._generate_on(self.route(ids), None, ids, max_new, sampling, cancel, embeddings)
+            yield from self._generate_on(self.route(ids), None, ids, max_new, sampling, cancel, embeddings, ids)
             return
         # Checkpoints contain text only. In GENI the same pad ids can stand for different
         # pictures; only the part preceding the first real image may identify a portable prefix.
         prefix = ids if embeddings is None else ids[:getattr(cancel, "_strata_text_before_image", 0)]
-        with self.handoff.match(prefix) as checkpoint:
+        affinity = ids
+        if embeddings is not None:
+            keys = sampling.get("strata_img_keys") if sampling else None
+            # Image pad IDs encode dimensions only. Include image identity in the routing
+            # hash, and omit everything after the first picture if its keys are unavailable.
+            affinity = list(prefix)
+            if isinstance(keys, list) and keys and all(isinstance(key, str) for key in keys) and len(prefix) < len(ids):
+                affinity += [tuple(keys)] + list(ids[len(prefix) + 1:])
+        with contextlib.ExitStack() as lease:
+            checkpoint = lease.enter_context(self.handoff.match(prefix))
             if checkpoint is None and embeddings is None:
                 k = self.route(ids)
             else:
-                k = self._route_available(checkpoint, ids, cancel)
+                k = self._route_available(checkpoint, affinity, cancel)
                 if k is None:     # cancelled before reserving an engine
                     return
-            yield from self._generate_on(k, checkpoint, ids, max_new, sampling, cancel, embeddings)
+            yield from self._generate_on(k, checkpoint, ids, max_new, sampling, cancel, embeddings, affinity, lease)
+
+    @staticmethod
+    def _queue_poll(cancel):
+        from serve.server_parts.engines import QueueWaitExpired
+        deadline = getattr(cancel, "_strata_queue_deadline", None)
+        if deadline is None:
+            return 0.25
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+        return min(remaining, 0.25)
 
     def _route_available(self, checkpoint, ids, cancel):
         # Choose at availability time. A thread queued on the source engine's run_lock
@@ -600,7 +621,10 @@ class ReplicaEngine:
             while True:
                 if cancel is not None and cancel.is_set():
                     return None
+                timeout = self._queue_poll(cancel)
                 alive = [k for k, e in enumerate(self.engines) if e.alive()]
+                if len(alive) < len(self.engines):
+                    self.heal()
                 if not alive:
                     return -1
                 if checkpoint is None:
@@ -623,17 +647,15 @@ class ReplicaEngine:
                     break    # protected live sessions: use native routing and cache behavior
                 if waiting_since is None:
                     waiting_since = time.monotonic()
-                self.available.wait(.25)
+                self.available.wait(timeout)
         if chosen is None:
             return self.route(ids)
-        if len(alive) < len(self.engines):
-            self.heal()
         if checkpoint is None and waiting_since is not None:
             print(f"[strata] image request took free replica {chosen} after "
                   f"{time.monotonic() - waiting_since:.3f}s", flush=True)
         return chosen
 
-    def _generate_on(self, k, checkpoint, ids, max_new, sampling, cancel, embeddings):
+    def _generate_on(self, k, checkpoint, ids, max_new, sampling, cancel, embeddings, affinity, lease=None):
         # imported here: serve.server imports this module
         from serve.server import EngineDied, EngineNonFinite
         if k < 0:
@@ -650,15 +672,22 @@ class ReplicaEngine:
             selected = getattr(cancel, "_strata_replica_selected", None)
             if selected is not None:
                 selected(k)
-            self.router.note(k, ids)
+            self.router.note(k, affinity)
             if not int(getattr(e, "batch", 0) or 0):          # no slots: this replica takes one request at a time
                 lock = self.run_locks[k]
-                while not lock.acquire(timeout=0.25):
+                while not lock.acquire(timeout=self._queue_poll(cancel) if self.handoff else 0.25):
                     if cancel is not None and cancel.is_set():
                         return
                 held = True
+                if self.handoff:
+                    if cancel is not None and cancel.is_set():
+                        return
+                    self._queue_poll(cancel)
+            epoch = self.handoff.epoch if self.handoff else None
             if checkpoint is not None:
                 self.handoff.restore(checkpoint, k, e)
+            if lease is not None:
+                lease.close()  # RESTORE finished. The next SAVE can now replace this file.
             if self.handoff:
                 self.handoff.forget_live(k, protected=True)
             native_before = e.last
@@ -698,7 +727,7 @@ class ReplicaEngine:
                                 and not nonfinite and not (cancel and cancel.is_set())):
                             if len(ids) >= self.handoff.minimum + 64:
                                 try:
-                                    self.handoff.save(k, e, ids)
+                                    self.handoff.save(k, e, ids, epoch)
                                 except EngineDied as exc:
                                     # GEN already ended successfully. Take a broken SAVE pipe out of use
                                     # without turning the client's completed answer into a failure.
@@ -709,8 +738,11 @@ class ReplicaEngine:
                 finally:
                     if nonfinite:                       # #879: the engine dropped every cached conversation
                         self._forget_replica(k)
+                        if self.handoff:
+                            self.handoff.discard_suspect()
+                            self.handoff.forget_live(k, protected=True)
                     elif produced and e.alive():
-                        self.router.note(k, list(ids) + produced)
+                        self.router.note(k, list(affinity) + produced if len(affinity) == len(ids) else affinity)
                     if held:
                         self.run_locks[k].release()
                     with self.available:
