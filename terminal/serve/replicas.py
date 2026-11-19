@@ -337,7 +337,7 @@ class ReplicaEngine:
     NOT_HERE = {"session_file", "vram", "ctl", "slot_cv"}       # not offered: one conversation file / VRAM resize / control line
     PROPAGATE = {"silence_s", "gpu_busy"}
 
-    def __init__(self, engines: list, load_tokens: int = LOAD_TOKENS):
+    def __init__(self, engines: list, load_tokens: int = LOAD_TOKENS, handoff=None):
         if len(engines) < 2:
             raise ValueError("ReplicaEngine needs two or more engines")
         d = self.__dict__
@@ -347,6 +347,8 @@ class ReplicaEngine:
         d["inflight"] = [0] * len(engines)
         d["run_locks"] = [threading.Lock() for _ in engines]    # an engine without batch slots: one request at a time
         d["lock"] = threading.Lock()
+        d["available"] = threading.Condition(d["lock"])
+        d["handoff"] = handoff
         d["tl"] = threading.local()
         d["healing"] = {}
         d["heal_at"] = [0.0] * len(engines)
@@ -495,7 +497,7 @@ class ReplicaEngine:
         def one(k):
             try:
                 self.engines[k].restart(tries)
-                self.router.forget(k)
+                self._forget_replica(k)
             except BaseException as e:           # noqa: BLE001
                 errors[k] = e
         ts = [threading.Thread(target=one, args=(k,), daemon=True) for k in dead]
@@ -508,11 +510,16 @@ class ReplicaEngine:
         for k, e in errors.items():
             print(f"[strata] replica {k} did not start ({e}); the others serve", flush=True)
 
+    def _forget_replica(self, k):
+        self.router.forget(k)
+        if self.handoff:
+            self.handoff.invalidate(k)
+
     def unload(self):
         for e in self.engines:
             e.unload()
         for k in range(len(self.engines)):
-            self.router.forget(k)
+            self._forget_replica(k)
 
     def close(self):
         err = None
@@ -522,6 +529,8 @@ class ReplicaEngine:
             except BaseException as x:           # noqa: BLE001
                 err = err or x
         remove_arena(self.__dict__.get("arena_file"))   # (an engine that still maps it keeps its pages)
+        if self.handoff:
+            self.handoff.close()
         if err:
             raise err
 
@@ -557,7 +566,7 @@ class ReplicaEngine:
                 try:
                     print(f"[strata] replica {k} had stopped; starting it again", flush=True)
                     self.engines[k].restart()
-                    self.router.forget(k)
+                    self._forget_replica(k)
                     print(f"[strata] replica {k} is running again", flush=True)
                 except BaseException as x:       # noqa: BLE001
                     print(f"[strata] replica {k} did not start again: {x}", flush=True)
@@ -566,9 +575,44 @@ class ReplicaEngine:
             threading.Thread(target=run, daemon=True).start()
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        if self.handoff is None or embeddings is not None:
+            yield from self._generate_on(self.route(ids), None, ids, max_new, sampling, cancel, embeddings)
+            return
+        with self.handoff.match(ids) as checkpoint:
+            if checkpoint is None:
+                k = self.route(ids)
+            else:
+                k = self._route_checkpoint(checkpoint, ids, cancel)
+                if k is None:     # cancelled before reserving an engine
+                    return
+            yield from self._generate_on(k, checkpoint, ids, max_new, sampling, cancel, embeddings)
+
+    def _route_checkpoint(self, checkpoint, ids, cancel):
+        # Choose at availability time. A thread queued on the source engine's run_lock
+        # cannot notice the other GPU finishing. Ordinary requests keep the stock policy.
+        matched = self.router.matched(ids)
+        with self.available:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    return None
+                alive = [k for k, e in enumerate(self.engines) if e.alive()]
+                if not alive:
+                    return -1
+                ready = [k for k in alive if not self.inflight[k] and self.handoff.ready(checkpoint, k)]
+                if ready:
+                    k = max(ready, key=lambda k: (matched[k], -self.routed[k]))
+                    self.inflight[k] += 1
+                    self.routed[k] += 1
+                    return k
+                if not all(self.inflight[k] for k in alive) and not any(
+                        self.handoff.ready(checkpoint, k) for k in alive):
+                    break    # protected live sessions: use native routing and cache behavior
+                self.available.wait(.25)
+        return self.route(ids)
+
+    def _generate_on(self, k, checkpoint, ids, max_new, sampling, cancel, embeddings):
         # imported here: serve.server imports this module
         from serve.server import EngineDied, EngineNonFinite
-        k = self.route(ids)
         if k < 0:
             raise EngineDied("no replica is running; this request was not sent")
         e = self.engines[k]
@@ -590,6 +634,10 @@ class ReplicaEngine:
                     if cancel is not None and cancel.is_set():
                         return
                 held = True
+            if checkpoint is not None:
+                self.handoff.restore(checkpoint, k, e)
+            if self.handoff:
+                self.handoff.forget_live(k, protected=True)
             native_before = e.last
             if embeddings is not None:
                 gen = e.generate(ids, max_new, sampling, cancel, embeddings=embeddings)
@@ -621,15 +669,30 @@ class ReplicaEngine:
                     # no new DONE the caller's earlier object stays, so Service does not record an old result as new
                     if gen is not None and e.last is not native_before:
                         self.tl.last = dict(e.last)
+                        # Service closes this generator at EOS; the child's close drains DONE.
+                        # Snapshot only after that drain, while this thread still owns the engine.
+                        if (self.handoff and embeddings is None and produced and e.alive()
+                                and not nonfinite and not (cancel and cancel.is_set())):
+                            if len(ids) >= self.handoff.minimum + 64:
+                                try:
+                                    self.handoff.save(k, e, ids)
+                                except EngineDied as exc:
+                                    # GEN already ended successfully. Take a broken SAVE pipe out of use
+                                    # without turning the client's completed answer into a failure.
+                                    self.quarantine(k)
+                                    print(f"[strata] replica {k} ended during handoff save: {exc}", flush=True)
+                            elif len(ids) + len(produced) < self.handoff.minimum:
+                                self.handoff.forget_live(k, protected=False)
                 finally:
+                    if nonfinite:                       # #879: the engine dropped every cached conversation
+                        self._forget_replica(k)
+                    elif produced and e.alive():
+                        self.router.note(k, list(ids) + produced)
                     if held:
                         self.run_locks[k].release()
-                    with self.lock:
+                    with self.available:
                         self.inflight[k] -= 1
-                    if nonfinite:                       # #879: the engine dropped every cached conversation
-                        self.router.forget(k)
-                    elif produced:
-                        self.router.note(k, list(ids) + produced)
+                        self.available.notify_all()
 
     def quarantine(self, k: int) -> None:
         """A replica whose pipe could not be drained is out of the routing until it has been started again: its process
@@ -645,4 +708,4 @@ class ReplicaEngine:
                 proc.kill()
         except (OSError, AttributeError, ValueError):
             pass
-        self.router.forget(k)
+        self._forget_replica(k)

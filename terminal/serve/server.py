@@ -7950,7 +7950,19 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
             return start_replicas({**cfg, "replica_shared_arena": False}, groups, exe, effort_end, lazy, offline=offline)
         raise SystemExit(f"[strata] replica {i} did not start: {e}")
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
-    eng = rp.ReplicaEngine(engines, load_tokens=load)
+    handoff = None
+    if cfg.get("replica_handoff_dir"):
+        from serve.replica_handoff import Handoff
+        try:
+            if any(e.batch for e in engines):
+                raise ValueError("replica_handoff_dir needs one slot per replica")
+            handoff = Handoff(cfg["replica_handoff_dir"], int(cfg.get("replica_handoff_mib", 8192)), n)
+        except (OSError, TypeError, ValueError) as exc:
+            for e in engines:
+                e.close()
+            rp.remove_arena(arena)
+            raise SystemExit(f"replica handoff: {exc}") from exc
+    eng = rp.ReplicaEngine(engines, load_tokens=load, handoff=handoff)
     if arena:
         eng.__dict__["arena_file"] = arena
         import atexit

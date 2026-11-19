@@ -848,6 +848,24 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
   only for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
   change later output.
 
+### Warm text conversations across replicas (opt-in)
+
+With one slot per replica, set `replica_handoff_dir` to a writable directory on the server to let an idle replica
+resume a long text conversation from another card. A private directory holds native session files for this server
+process. Use a size-limited RAM filesystem for RAM-speed transfers. `replica_handoff_mib` bounds retained files
+(default 8192 MiB). Allow extra room for concurrent saves in progress. Removing `replica_handoff_dir` and
+restarting restores ordinary replica routing.
+
+After a successful long text turn, the server saves its state before releasing the replica. A follow-up with a
+matching prompt prefix can take the next available compatible replica. Native RESTORE verifies the model and
+settings, and generation checks the actual token prefix. The destination keeps a checkpoint of its previous long
+text conversation. A failed save, an eviction, or an image in the request can leave a chat on ordinary routing.
+Small text histories (under 8192 tokens) can be reread. Image turns use the existing vision path. A replica holding
+an uncheckpointed long or image turn can serve it normally without replacing its live state via a handoff.
+
+Check the server log for `handoff saved replica` and `handoff restored replica`, then check the engine's prompt
+reuse on the next turn. Saving and restoring both cost time and RAM bandwidth.
+
 ### The web page (Chat, Images, Monitor, About)
 
 Open the server's address in a browser. Everything in it runs from the server's own files: no CDN, no outside address. Chats,
